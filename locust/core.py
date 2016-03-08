@@ -1,21 +1,41 @@
-import gevent
-from gevent import monkey, GreenletExit
+from gevent import monkey; monkey.patch_all(thread=False)
 
-monkey.patch_all(thread=False)
+import gevent
+
+from gevent import GreenletExit
+from gevent.pool import Group
+from gevent.event import Event
+
+import functools
+import logging
+import random
+import sys
+import traceback
+import warnings
 
 from time import time
-import sys
-import random
-import warnings
-import traceback
-import logging
 
 from clients import HttpSession
 import events
 
-from exception import LocustError, InterruptTaskSet, RescheduleTask, RescheduleTaskImmediately, StopLocust
+from exception import LocustError, InterruptTaskSet, RescheduleTask, RescheduleTaskImmediately, StopLocust, StopGrasshopper
 
 logger = logging.getLogger(__name__)
+
+
+def job(enabled=True):
+    # XXX: no args yet... what parameterization would be useful? run_local and run_remote
+    def decorator_func(func):
+        if enabled:
+            func.grasshopper_job_enabled = True
+        return func
+
+    if callable(enabled):
+        func = enabled
+        enabled = True
+        return decorator_func(func)
+    else:
+        return decorator_func
 
 
 def task(weight=1):
@@ -61,6 +81,42 @@ class NoClientWarningRaiser(object):
         raise LocustError("No client instantiated. Did you intend to inherit from HttpLocust?")
 
 
+class Grasshopper(object):
+    """
+    Represents a "agent" which is meant to supplement some component of the system under test.
+
+    The behaviour of this agent is defined by the job_set attribute, which should point to a
+    :py:class:`JobSet <locust.core.JobSet>` class.
+
+    """
+
+    host = None
+    """Base hostname to interact with. i.e: http://127.0.0.1:1234"""
+
+    job_set = None
+    """JobSet class that defines the execution behaviour of this Grasshopper"""
+
+    stop_timeout = None
+    """Number of seconds after which the Grasshopper will die. If None it won't timeout."""
+
+    client = NoClientWarningRaiser()
+    _catch_exceptions = True
+
+    def __init__(self):
+        super(Grasshopper, self).__init__()
+        self._job_set = self.__class__.job_set(self)
+
+    def run(self):
+        try:
+            self._job_set.run()
+        except StopGrasshopper:
+            pass
+        logger.info('Grasshopper exiting!')
+
+    def stop(self, wait=True):
+        self._job_set.stop()
+
+
 class Locust(object):
     """
     Represents a "user" which is to be hatched and attack the system that is to be load tested.
@@ -84,7 +140,7 @@ class Locust(object):
     
     task_set = None
     """TaskSet class that defines the execution behaviour of this locust"""
-    
+
     stop_timeout = None
     """Number of seconds after which the Locust will die. If None it won't timeout."""
 
@@ -352,4 +408,92 @@ class TaskSet(object):
         Locust instance.
         """
         return self.locust.client
+
+
+class JobSetMeta(type):
+    def __new__(mcs, classname, bases, classDict):
+        new_jobs = []
+        for base in bases:
+            if hasattr(base, "jobs") and base.jobs:
+                new_jobs += base.jobs
+
+        if "jobs" in classDict and classDict["jobs"] is not None:
+            assert(isinstance(classDict["jobs"], list))
+            for job in classDict["jobs"]:
+                new_jobs.append(job)
+
+        for item in classDict.itervalues():
+            if hasattr(item, "grasshopper_job_enabled"):
+                new_jobs.append(item)
+
+        classDict["jobs"] = new_jobs
+
+        return type.__new__(mcs, classname, bases, classDict)
+
+
+class JobSet(object):
+    """
+    """
+    __metaclass__ = JobSetMeta
+
+    STOP_TIMEOUT = 5
+
+    jobs = []
+
+    grasshopper = None
+
+    def __init__(self, grasshopper):
+        # XXX: how do we want to pass arguments to jobs
+
+        self.grasshopper = grasshopper
+
+        self.stop_event = Event()
+        self._greenlets = Group()
+        self._time_start = time()
+
+    def stop(self, wait=False):
+        self.stop_event.set()
+        if wait:
+            self._stop()
+
+    def _stop(self):
+        try:
+            self._greenlets.join(self.__class__.STOP_TIMEOUT)
+        except Exception as e:
+            logger.exception('killing grasshoppers')
+            self._greenlets.kill()
+            self._greenlets.join()
+
+    def run(self):
+        if hasattr(self, "on_start"):
+            self.on_start()
+
+        for job in self.jobs:
+            self.start_job(job)
+
+        while (not self.stop_event.is_set()):
+            if self.grasshopper.stop_timeout is not None and time() - self._time_start > self.grasshopper.stop_timeout:
+                self.stop()
+                break
+            gevent.sleep(1)
+
+        self._stop()
+
+    def start_job(self, job, *args, **kwargs):
+        # check if the function is a method bound to the current JobSet, and if so, don't pass self as first argument
+        if hasattr(job, "im_self") and job.__self__ == self:
+            # job is a bound method on self
+            job = functools.partial(job, *args, **kwargs)
+        else:
+            # job is a function
+            job = functools.partial(job, self, *args, **kwargs)
+        self._greenlets.spawn(job)
+
+    @property
+    def client(self):
+        """
+        Reference to the :py:attr:`client <locust.core.Locust.client>` attribute of the root
+        Locust instance.
+        """
+        return self.grasshopper.client
 

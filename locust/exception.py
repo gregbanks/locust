@@ -1,6 +1,9 @@
 class LocustError(Exception):
     pass
 
+class GrasshopperError(Exception):
+    pass
+
 class ResponseError(Exception):
     pass
 
@@ -20,6 +23,9 @@ class InterruptTaskSet(Exception):
         self.reschedule = reschedule
 
 class StopLocust(Exception):
+    pass
+
+class StopGrasshopper(Exception):
     pass
 
 class RescheduleTask(Exception):

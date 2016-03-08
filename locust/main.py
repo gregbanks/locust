@@ -14,7 +14,7 @@ import web
 from log import setup_logging, console_logger
 from stats import stats_printer, print_percentile_stats, print_error_report, print_stats
 from inspectlocust import print_task_ratio, get_task_ratio_dict
-from core import Locust, HttpLocust
+from core import Grasshopper, Locust, HttpLocust
 from runners import MasterLocustRunner, SlaveLocustRunner, LocalLocustRunner
 import events
 
@@ -290,6 +290,20 @@ def is_locust(tup):
     )
 
 
+def is_grasshopper(tup):
+    """
+    Takes (name, object) tuple, returns True if it's a public Locust subclass.
+    """
+    name, item = tup
+    return bool(
+            inspect.isclass(item)
+            and issubclass(item, Grasshopper)
+            and hasattr(item, "job_set")
+            and getattr(item, "job_set")
+            and not name.startswith('_')
+    )
+
+
 def load_locustfile(path):
     """
     Import given locustfile path and return (docstring, callables).
@@ -328,7 +342,8 @@ def load_locustfile(path):
         del sys.path[0]
     # Return our two-tuple
     locusts = dict(filter(is_locust, vars(imported).items()))
-    return imported.__doc__, locusts
+    grasshoppers = dict(filter(is_grasshopper, vars(imported).items()))
+    return imported.__doc__, locusts, grasshoppers
 
 def main():
     parser, options, arguments = parse_options()
@@ -346,7 +361,7 @@ def main():
         logger.error("Could not find any locustfile! Ensure file ends in '.py' and see --help for available options.")
         sys.exit(1)
 
-    docstring, locusts = load_locustfile(locustfile)
+    docstring, locusts, grasshoppers = load_locustfile(locustfile)
 
     if options.list_commands:
         console_logger.info("Available Locusts:")
@@ -360,16 +375,19 @@ def main():
 
     # make sure specified Locust exists
     if arguments:
-        missing = set(arguments) - set(locusts.keys())
+        missing = set(arguments) - set(locusts.keys()) - set(grasshoppers.keys())
         if missing:
-            logger.error("Unknown Locust(s): %s\n" % (", ".join(missing)))
+            logger.error("Unknown Locust(s)/Grasshopper(s): %s\n" % (", ".join(missing)))
             sys.exit(1)
         else:
-            names = set(arguments) & set(locusts.keys())
-            locust_classes = [locusts[n] for n in names]
+            locust_names = set(arguments) & set(locusts.keys())
+            grasshopper_names = set(arguments) & set(grasshoppers.keys())
+            locust_classes = [locusts[n] for n in locust_names]
+            grasshopper_classes = [grasshoppers[n] for n in grasshopper_names]
     else:
         locust_classes = locusts.values()
-    
+        grasshopper_classes = grasshoppers.values()
+
     if options.show_task_ratio:
         console_logger.info("\n Task ratio per locust class")
         console_logger.info( "-" * 80)
@@ -395,19 +413,19 @@ def main():
     if not options.no_web and not options.slave:
         # spawn web greenlet
         logger.info("Starting web monitor at %s:%s" % (options.web_host or "*", options.port))
-        main_greenlet = gevent.spawn(web.start, locust_classes, options)
+        main_greenlet = gevent.spawn(web.start, locust_classes, grasshopper_classes, options)
     
     if not options.master and not options.slave:
-        runners.locust_runner = LocalLocustRunner(locust_classes, options)
+        runners.locust_runner = LocalLocustRunner(locust_classes, grasshopper_classes, options)
         # spawn client spawning/hatching greenlet
         if options.no_web:
             runners.locust_runner.start_hatching(wait=True)
             main_greenlet = runners.locust_runner.greenlet
     elif options.master:
-        runners.locust_runner = MasterLocustRunner(locust_classes, options)
+        runners.locust_runner = MasterLocustRunner(locust_classes, grasshopper_classes, options)
     elif options.slave:
         try:
-            runners.locust_runner = SlaveLocustRunner(locust_classes, options)
+            runners.locust_runner = SlaveLocustRunner(locust_classes, grasshopper_classes, options)
             main_greenlet = runners.locust_runner.greenlet
         except socket.error, e:
             logger.error("Failed to connect to the Locust master: %s", e)

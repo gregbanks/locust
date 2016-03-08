@@ -197,7 +197,8 @@ def exceptions_csv():
     response.headers["Content-disposition"] = disposition
     return response
 
-def start(locust, options):
+def start(locust, grasshoppers, options):
+    # XXX: what is the intended usage of locust/grasshopper here?
     wsgi.WSGIServer((options.web_host, options.port), app, log=None).serve_forever()
 
 def _sort_stats(stats):

@@ -26,13 +26,16 @@ SLAVE_REPORT_INTERVAL = 3.0
 
 
 class LocustRunner(object):
-    def __init__(self, locust_classes, options):
+    def __init__(self, locust_classes, grasshopper_classes, options):
         self.locust_classes = locust_classes
+        self.grasshopper_classes = grasshopper_classes
         self.hatch_rate = options.hatch_rate
         self.num_clients = options.num_clients
         self.num_requests = options.num_requests
         self.host = options.host
         self.locusts = Group()
+        self.grasshopper_greenlets = Group()
+        self.grasshoppers = []
         self.state = STATE_INIT
         self.hatching_greenlet = None
         self.exceptions = {}
@@ -121,7 +124,27 @@ class LocustRunner(object):
         hatch()
         if wait:
             self.locusts.join()
+            # XXX: refactor this when we can issue `stop` calls
+            self.kill_grasshoppers(block=True)
             logger.info("All locusts dead\n")
+
+    def spawn_grasshoppers(self, wait=True):
+        if len(self.grasshoppers):
+            logger.debug('grasshoppers already spawned')
+            return
+        # XXX: refactor this so we can get at the underlying grasshopper to issue `stop` calls
+        def start_grasshopper(grasshopper):
+            try:
+                self.grasshoppers.append(grasshopper())
+                self.grasshoppers[-1].run()
+            except GreenletExit:
+                pass
+        for cls in self.grasshopper_classes:
+            self.grasshopper_greenlets.spawn(start_grasshopper, cls)
+        if wait:
+            self.grasshopper_greenlets.join()
+            logger.info("All grasshoppers dead\n")
+
 
     def kill_locusts(self, kill_count):
         """
@@ -142,12 +165,20 @@ class LocustRunner(object):
             self.locusts.killone(g)
         events.hatch_complete.fire(user_count=self.num_clients)
 
-    def start_hatching(self, locust_count=None, hatch_rate=None, wait=False):
+    def kill_grasshoppers(self, block=True):
+        for grasshopper in self.grasshoppers:
+            grasshopper.stop(wait=block)
+        self.grasshoppers = []
+        self.grasshopper_greenlets.kill()
+        self.grasshopper_greenlets.join()
+
+    def start_hatching(self, locust_count=None, hatch_rate=None, hatch_grasshoppers=True, wait=False):
         if self.state != STATE_RUNNING and self.state != STATE_HATCHING:
             self.stats.clear_all()
             self.stats.start_time = time()
             self.exceptions = {}
             events.locust_start_hatching.fire()
+
 
         # Dynamically changing the locust count
         if self.state != STATE_INIT and self.state != STATE_STOPPED:
@@ -167,6 +198,10 @@ class LocustRunner(object):
         else:
             if hatch_rate:
                 self.hatch_rate = hatch_rate
+            # XXX: spawn grasshoppers once
+            if hatch_grasshoppers:
+                # XXX: can't wait here
+                self.spawn_grasshoppers(wait=False)
             if locust_count is not None:
                 self.spawn_locusts(locust_count, wait=wait)
             else:
@@ -177,6 +212,7 @@ class LocustRunner(object):
         if self.hatching_greenlet and not self.hatching_greenlet.ready():
             self.hatching_greenlet.kill(block=True)
         self.locusts.kill(block=True)
+        self.kill_grasshoppers(block=True)
         self.state = STATE_STOPPED
         events.locust_stop_hatching.fire()
 
@@ -188,8 +224,8 @@ class LocustRunner(object):
         self.exceptions[key] = row
 
 class LocalLocustRunner(LocustRunner):
-    def __init__(self, locust_classes, options):
-        super(LocalLocustRunner, self).__init__(locust_classes, options)
+    def __init__(self, locust_classes, grasshopper_classes, options):
+        super(LocalLocustRunner, self).__init__(locust_classes, grasshopper_classes, options)
 
         # register listener thats logs the exception for the local runner
         def on_locust_error(locust_instance, exception, tb):
@@ -197,13 +233,13 @@ class LocalLocustRunner(LocustRunner):
             self.log_exception("local", str(exception), formatted_tb)
         events.locust_error += on_locust_error
 
-    def start_hatching(self, locust_count=None, hatch_rate=None, wait=False):
-        self.hatching_greenlet = gevent.spawn(lambda: super(LocalLocustRunner, self).start_hatching(locust_count, hatch_rate, wait=wait))
+    def start_hatching(self, locust_count=None, hatch_rate=None, hatch_grasshoppers=True, wait=False):
+        self.hatching_greenlet = gevent.spawn(lambda: super(LocalLocustRunner, self).start_hatching(locust_count, hatch_rate, hatch_grasshoppers, wait=wait))
         self.greenlet = self.hatching_greenlet
 
 class DistributedLocustRunner(LocustRunner):
-    def __init__(self, locust_classes, options):
-        super(DistributedLocustRunner, self).__init__(locust_classes, options)
+    def __init__(self, locust_classes, grasshopper_classes, options):
+        super(DistributedLocustRunner, self).__init__(locust_classes, grasshopper_classes, options)
         self.master_host = options.master_host
         self.master_port = options.master_port
         self.master_bind_host = options.master_bind_host
@@ -262,7 +298,10 @@ class MasterLocustRunner(DistributedLocustRunner):
     def user_count(self):
         return sum([c.user_count for c in self.clients.itervalues()])
     
-    def start_hatching(self, locust_count, hatch_rate):
+    def start_hatching(self, locust_count, hatch_rate, hatch_grasshoppers=True):
+        # XXX: refactor
+        if hatch_grasshoppers:
+            self.spawn_grasshoppers(wait=False)
         num_slaves = len(self.clients.ready) + len(self.clients.running)
         if not num_slaves:
             logger.warning("You are running in distributed mode but have no slave servers connected. "
@@ -300,11 +339,14 @@ class MasterLocustRunner(DistributedLocustRunner):
         self.state = STATE_HATCHING
 
     def stop(self):
+        # XXX: refactor
+        self.kill_grasshoppers(block=True)
         for client in self.clients.hatching + self.clients.running:
             self.server.send(Message("stop", None, None))
         events.master_stop_hatching.fire()
     
     def quit(self):
+        self.stop()
         for client in self.clients.itervalues():
             self.server.send(Message("quit", None, None))
         self.greenlet.kill(block=True)
@@ -377,6 +419,9 @@ class SlaveLocustRunner(DistributedLocustRunner):
             formatted_tb = "".join(traceback.format_tb(tb))
             self.client.send(Message("exception", {"msg" : str(exception), "traceback" : formatted_tb}, self.client_id))
         events.locust_error += on_locust_error
+
+    def start_hatching(self, locust_count=None, hatch_rate=None, hatch_grasshoppers=False, wait=False):
+        super(SlaveLocustRunner, self).start_hatching(locust_count, hatch_rate, hatch_grasshoppers, wait)
 
     def worker(self):
         while True:
